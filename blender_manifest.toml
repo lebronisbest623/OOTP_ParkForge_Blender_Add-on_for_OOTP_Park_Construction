@@ -1,0 +1,20 @@
+schema_version = "1.0.0"
+
+id = "ootp_parkforge"
+version = "0.2.1"
+name = "OOTP ParkForge"
+tagline = "Import and export OOTP stadium POD packages"
+maintainer = "Codex / lebronisbest623"
+type = "add-on"
+
+blender_version_min = "4.0.0"
+
+license = [
+  "SPDX:MIT",
+]
+
+tags = [
+  "Import-Export",
+]
+
+website = "https://github.com/lebronisbest623/OOTP_ParkForge_Blender_Add-on_for_OOTP_Park_Construction"

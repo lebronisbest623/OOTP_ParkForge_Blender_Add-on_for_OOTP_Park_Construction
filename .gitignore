@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.blend1
+*.blend2
+*.tmp
+*.bak
+
+dist/
+build/
+.artifacts/
+
