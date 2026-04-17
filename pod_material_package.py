@@ -380,6 +380,18 @@ def build_material_package(material_dump: list[dict] | str | Path, output_dir: s
                 shutil.copy2(src, dst)
             diffuse_rel = plain_name
             secondary_rel = None
+        elif mode == "stock_background":
+            # Background behaves like a stock panorama card in OOTP parks.
+            # Keep the exact template material block and reference the
+            # diffuse texture by plain top-level filename rather than
+            # textures/... so day/night transitions resolve like the stock park.
+            plain_name = Path(diffuse_rel).name
+            src = textures_dir / plain_name
+            dst = out_dir / plain_name
+            if src.exists():
+                shutil.copy2(src, dst)
+            diffuse_rel = plain_name
+            secondary_rel = None
         elif mode in ("opaque_shadow", "alpha_shadow", "alpha_blend"):
             pfx_filename = f"{safe_name}.pfx"
             effect_name = "c2u_alpha_shadow" if mode == "alpha_shadow" else "c2u_shadow"
@@ -396,6 +408,7 @@ def build_material_package(material_dump: list[dict] | str | Path, output_dir: s
             {
                 "name": safe_name,
                 "source_material_name": material_name,
+                "template_material_name": row.get("template_material_name", material_name),
                 "mode": mode,
                 "diffuse_path": diffuse_rel,
                 "secondary_path": secondary_rel,

@@ -204,10 +204,18 @@ def _material_has_emission(material: bpy.types.Material) -> bool:
     return False
 
 
+def _template_semantic_name(name: str) -> str:
+    normalized = name.lower().strip()
+    normalized = re.sub(r"\.\d{3}$", "", normalized)
+    return normalized
+
+
 def _material_blend_mode(material: bpy.types.Material) -> str:
-    name = material.name.lower()
+    name = _template_semantic_name(material.name)
     if name == "ground":
         return "ground"
+    if name == "background":
+        return "stock_background"
     if name == "stand_lighting":
         return "stock_lighting"
     if (
@@ -327,6 +335,7 @@ def _hydrate_material_rows(context: bpy.types.Context, material_rows: list[dict]
         hydrated.append({
             "object": row["object"],
             "material": row["material"],
+            "template_material_name": _template_semantic_name(material.name),
             "blend_mode": _material_blend_mode(material),
             "images": images,
         })

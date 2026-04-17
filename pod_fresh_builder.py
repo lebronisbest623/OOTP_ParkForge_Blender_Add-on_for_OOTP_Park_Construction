@@ -288,6 +288,7 @@ def _build_materials_and_textures_from_spec(
 ) -> tuple[list[PODBlock], list[PODBlock], dict[str, int]]:
     mode_to_template = {
         "ground": template_mat_name_map.get("Ground") or fallback_template,
+        "stock_background": template_mat_name_map.get("Background") or fallback_template,
         "opaque": template_mat_name_map.get("Ground") or fallback_template,
         "opaque_shadow": template_mat_name_map.get("Stand") or fallback_template,
         "alpha_shadow": template_mat_name_map.get("Alphatest") or fallback_template,
@@ -318,8 +319,13 @@ def _build_materials_and_textures_from_spec(
     for spec in materials_spec:
         name = str(spec["name"])
         source_name = str(spec.get("source_material_name") or name)
+        template_name = str(spec.get("template_material_name") or source_name)
         mode = str(spec.get("mode", "opaque_shadow")).lower()
-        exact_template = template_mat_name_map.get(source_name) or template_mat_name_map.get(name)
+        exact_template = (
+            template_mat_name_map.get(template_name)
+            or template_mat_name_map.get(source_name)
+            or template_mat_name_map.get(name)
+        )
         template = exact_template or mode_to_template.get(mode)
         if template is None:
             raise PODFreshBuildError(f"No template material available for mode '{mode}'")
