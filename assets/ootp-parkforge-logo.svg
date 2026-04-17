@@ -1,0 +1,18 @@
+<svg width="960" height="240" viewBox="0 0 960 240" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="960" height="240" rx="28" fill="#0D1520"/>
+
+  <g transform="translate(44 36)">
+    <rect x="0" y="0" width="168" height="168" rx="24" fill="#132233"/>
+    <path d="M84 24L132 72L84 120L36 72L84 24Z" fill="#F4F1E8"/>
+    <path d="M84 42L114 72L84 102L54 72L84 42Z" fill="#0D1520"/>
+    <path d="M84 54L102 72L84 90L66 72L84 54Z" fill="#E0A24A"/>
+    <circle cx="84" cy="72" r="6.5" fill="#F4F1E8"/>
+    <path d="M24 138H144" stroke="#2F6B45" stroke-width="16" stroke-linecap="round"/>
+    <path d="M34 152H134" stroke="#6FBF73" stroke-width="6" stroke-linecap="round" opacity="0.9"/>
+  </g>
+
+  <text x="248" y="88" fill="#F4F1E8" font-family="Segoe UI, Inter, Arial, sans-serif" font-size="32" font-weight="700" letter-spacing="3.5">OOTP</text>
+  <text x="248" y="150" fill="#F4F1E8" font-family="Segoe UI, Inter, Arial, sans-serif" font-size="60" font-weight="800" letter-spacing="-1">ParkForge</text>
+  <rect x="250" y="168" width="214" height="8" rx="4" fill="#E0A24A"/>
+  <text x="248" y="202" fill="#8FA4B8" font-family="Segoe UI, Inter, Arial, sans-serif" font-size="22" font-weight="600" letter-spacing="0.8">Blender Add-on for OOTP Park Construction</text>
+</svg>

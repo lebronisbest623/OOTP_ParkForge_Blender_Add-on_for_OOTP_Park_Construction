@@ -1,5 +1,9 @@
 # OOTP ParkForge
 
+<p>
+  <img src="./assets/ootp-parkforge-logo.svg" alt="OOTP ParkForge logo" width="720" />
+</p>
+
 Blender add-on for importing, editing, and exporting OOTP ballpark packages built around `AB.POD.2.0`.
 
 This repository is intentionally organized as a Blender-installable add-on package first, and a GitHub-friendly project second. The package root stays flat so Blender can install it directly, while supporting docs and release tooling live in dedicated folders.
