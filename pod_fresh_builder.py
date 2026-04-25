@@ -145,15 +145,11 @@ def _make_mesh_block(mesh_record: dict) -> PODBlock:
         raise PODFreshBuildError(f"Mesh {name} index count is not divisible by 3")
 
     interleaved = bytearray()
-    flip_lighting_v = material_name.lower() == "stand_lighting"
 
     for pos, normal, tangent, tex0, tex1 in zip(vertices, normals, tangents, uv0, uv1):
         pos = _blender_to_ootp_xyz(pos)
         normal = _blender_to_ootp_xyz(normal)
         tangent = _blender_to_ootp_xyz(tangent)
-        if flip_lighting_v:
-            tex0 = (float(tex0[0]), 1.0 - float(tex0[1]))
-            tex1 = (float(tex1[0]), 1.0 - float(tex1[1]))
         interleaved.extend(_pack_f32s(
             float(pos[0]), float(pos[1]), float(pos[2]),
             float(normal[0]), float(normal[1]), float(normal[2]),

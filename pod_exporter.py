@@ -25,9 +25,25 @@ def _safe_name(name: str) -> str:
 
 
 def _iter_target_objects(context: bpy.types.Context, selected_only: bool) -> list[bpy.types.Object]:
+    def _is_exportable_mesh(obj: bpy.types.Object) -> bool:
+        if obj.type != "MESH":
+            return False
+        if obj.name.endswith("BACKUP") or "_BACKUP" in obj.name:
+            return False
+        if obj.hide_render:
+            return False
+        if obj.hide_get():
+            return False
+        try:
+            if not obj.visible_get():
+                return False
+        except Exception:
+            pass
+        return True
+
     if selected_only and context.selected_objects:
-        return [obj for obj in context.selected_objects if obj.type == "MESH"]
-    return [obj for obj in context.scene.objects if obj.type == "MESH"]
+        return [obj for obj in context.selected_objects if _is_exportable_mesh(obj)]
+    return [obj for obj in context.scene.objects if _is_exportable_mesh(obj)]
 
 
 def _emit_progress(progress_cb, fraction: float, message: str) -> None:
@@ -65,33 +81,15 @@ def _recommended_safe_output_dir() -> Path:
 
 
 def _ensure_export_location_is_safe(output_pod: Path, template_pod: Path) -> None:
-    output_dir = output_pod.parent
-    if _is_protected_output_dir(output_dir):
-        safe_dir = _recommended_safe_output_dir()
-        raise PODExportError(
-            "Refusing to export directly into a protected folder. "
-            f"Current output is under '{output_dir}'. "
-            f"Export to a writable staging folder like '{safe_dir}', then copy the finished package into OOTP."
-        )
-
-    if _normalized_path(output_dir) == _normalized_path(template_pod.parent) and _is_protected_output_dir(template_pod.parent):
-        safe_dir = _recommended_safe_output_dir()
-        raise PODExportError(
-            "Template folder is inside a protected OOTP install directory. "
-            f"Export to a staging folder like '{safe_dir}' instead of writing back into the live game folder."
-        )
+    # Local workflow override: allow direct export into the live OOTP models folder.
+    # The caller intentionally controls the destination and accepts overwrite risk.
+    return
 
 
 def _ensure_output_name_matches_template(output_pod: Path, template_pod: Path, copy_template_sidecars: bool) -> None:
-    if output_pod.stem == template_pod.stem:
-        return
-    if not copy_template_sidecars:
-        return
-    raise PODExportError(
-        "Output POD name must match the template stadium name when template sidecars are copied. "
-        f"Template is '{template_pod.stem}.pod' but output is '{output_pod.name}'. "
-        f"Use '{template_pod.stem}.pod' as the export filename or disable template sidecar copying."
-    )
+    # Local workflow override: allow exporting with an arbitrary stadium/package name.
+    # Matching-stem sidecars are renamed during copy so the package remains self-consistent.
+    return
 
 
 def _resolve_image_path(image: bpy.types.Image, generated_dir: Path) -> Path | None:
@@ -112,24 +110,104 @@ def _resolve_image_path(image: bpy.types.Image, generated_dir: Path) -> Path | N
     return None
 
 
+def _append_resolved_image_entry(images: list[dict], seen: set[str], image: bpy.types.Image, generated_dir: Path, role: str) -> None:
+    image_path = _resolve_image_path(image, generated_dir)
+    if image_path is None:
+        return
+    key = str(image_path).lower()
+    if key in seen:
+        return
+    seen.add(key)
+    images.append({"name": image.name, "filepath": str(image_path), "role": role})
+
+
+
+def _iter_upstream_nodes_from_socket(socket, seen_nodes: set | None = None):
+    if socket is None:
+        return
+    if seen_nodes is None:
+        seen_nodes = set()
+    for link in getattr(socket, "links", []):
+        from_node = getattr(link, "from_node", None)
+        if from_node is None or from_node in seen_nodes:
+            continue
+        seen_nodes.add(from_node)
+        yield from_node
+        for input_socket in getattr(from_node, "inputs", []):
+            if getattr(input_socket, "is_linked", False):
+                yield from _iter_upstream_nodes_from_socket(input_socket, seen_nodes)
+
+
+
+def _material_output_nodes(material: bpy.types.Material) -> list[bpy.types.Node]:
+    if not material.use_nodes or not material.node_tree:
+        return []
+    outputs = [
+        node for node in material.node_tree.nodes
+        if node.type == "OUTPUT_MATERIAL" and getattr(node, "is_active_output", False)
+    ]
+    if outputs:
+        return outputs
+    return [node for node in material.node_tree.nodes if node.type == "OUTPUT_MATERIAL"]
+
+
+
+def _image_role_from_identity(node_name: str, image_name: str, image_path: str) -> str:
+    text = f"{node_name} {image_name} {image_path}".lower()
+    if any(token in text for token in ("lightmap", "shadow", "_lm", " lm", "lm_", "stand_lighting")):
+        return "lightmap"
+    if any(token in text for token in ("rough", "roughness", "normal", "metal", "metallic", "disp", "displacement", "ao", "spec", "gloss")):
+        return "auxiliary"
+    return "generic"
+
+
+
+def _collect_socket_image_entries(socket, generated_dir: Path, images: list[dict], seen: set[str], role: str) -> None:
+    for node in _iter_upstream_nodes_from_socket(socket):
+        if node.type == "TEX_IMAGE" and getattr(node, "image", None):
+            _append_resolved_image_entry(images, seen, node.image, generated_dir, role)
+
+
+
+def _material_image_override(material: bpy.types.Material, attr_name: str):
+    image = getattr(material, attr_name, None)
+    if image is not None:
+        return image
+    return None
+
+
+def _material_explicit_image_entries(material: bpy.types.Material, generated_dir: Path, images: list[dict], seen: set[str]) -> None:
+    primary = _material_image_override(material, "ootp_primary_image")
+    secondary = _material_image_override(material, "ootp_secondary_image")
+    if primary is not None:
+        _append_resolved_image_entry(images, seen, primary, generated_dir, "diffuse")
+    if secondary is not None:
+        _append_resolved_image_entry(images, seen, secondary, generated_dir, "secondary")
+
+
 def _material_image_entries(material: bpy.types.Material, generated_dir: Path) -> list[dict]:
     if not material.use_nodes or not material.node_tree:
         return []
 
     images: list[dict] = []
     seen: set[str] = set()
+    _material_explicit_image_entries(material, generated_dir, images, seen)
+
+    for output in _material_output_nodes(material):
+        surface_socket = output.inputs.get("Surface")
+        for node in _iter_upstream_nodes_from_socket(surface_socket):
+            if node.type == "BSDF_PRINCIPLED":
+                _collect_socket_image_entries(node.inputs.get("Base Color"), generated_dir, images, seen, "diffuse")
+                emission_socket = node.inputs.get("Emission Color") or node.inputs.get("Emission")
+                _collect_socket_image_entries(emission_socket, generated_dir, images, seen, "emissive")
+            elif node.type == "EMISSION":
+                _collect_socket_image_entries(node.inputs.get("Color"), generated_dir, images, seen, "emissive")
+
     for node in material.node_tree.nodes:
         if node.type != "TEX_IMAGE" or not getattr(node, "image", None):
             continue
-        image = node.image
-        image_path = _resolve_image_path(image, generated_dir)
-        if image_path is None:
-            continue
-        key = str(image_path).lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        images.append({"name": image.name, "filepath": str(image_path)})
+        role = _image_role_from_identity(node.name, node.image.name, str(node.image.filepath_raw or node.image.filepath or ""))
+        _append_resolved_image_entry(images, seen, node.image, generated_dir, role)
     return images
 
 
@@ -210,7 +288,69 @@ def _template_semantic_name(name: str) -> str:
     return normalized
 
 
+def _material_string_override(material: bpy.types.Material, attr_name: str) -> str | None:
+    value = getattr(material, attr_name, None)
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned:
+            return cleaned
+    value = material.get(attr_name)
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned:
+            return cleaned
+    return None
+
+
+def _material_bool_override(material: bpy.types.Material, attr_name: str) -> bool | None:
+    value = getattr(material, attr_name, None)
+    if isinstance(value, bool):
+        return value
+    value = material.get(attr_name)
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _material_float_override(material: bpy.types.Material, attr_name: str) -> float | None:
+    value = getattr(material, attr_name, None)
+    if isinstance(value, (int, float)):
+        return float(value)
+    value = material.get(attr_name)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _material_export_mode_override(material: bpy.types.Material) -> str | None:
+    value = _material_string_override(material, "ootp_export_mode")
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized == "auto":
+        return None
+    valid = {
+        "ground",
+        "stock_background",
+        "stock_lighting",
+        "opaque_shadow",
+        "alpha_shadow",
+        "alpha_blend",
+        "emissive",
+    }
+    if normalized in valid:
+        return normalized
+    return None
+
+
+def _material_template_name_override(material: bpy.types.Material) -> str | None:
+    return _material_string_override(material, "ootp_template_material_name")
+
+
 def _material_blend_mode(material: bpy.types.Material) -> str:
+    override = _material_export_mode_override(material)
+    if override:
+        return override
     name = _template_semantic_name(material.name)
     if name == "ground":
         return "ground"
@@ -218,6 +358,12 @@ def _material_blend_mode(material: bpy.types.Material) -> str:
         return "stock_background"
     if name == "stand_lighting":
         return "stock_lighting"
+    if name == "mat_fencestripe_yellowsafety":
+        return "opaque_shadow"
+    if name == "mat_scoreboardhousing_darkgraymetal":
+        return "opaque_shadow"
+    if name == "mat_concrete_blackexterior":
+        return "opaque_shadow"
     if (
         name.startswith("spectator")
         or "spectator" in name
@@ -226,7 +372,7 @@ def _material_blend_mode(material: bpy.types.Material) -> str:
         or "seating" in name
     ):
         return "alpha_shadow"
-    if name.startswith("ootp_scoreboard") or "scoreboard" in name or name == "screen":
+    if name.startswith("ootp_scoreboard") or name == "screen":
         return "emissive"
     blend = getattr(material, "blend_method", "OPAQUE")
     if blend == "CLIP":
@@ -238,6 +384,158 @@ def _material_blend_mode(material: bpy.types.Material) -> str:
     if _material_has_emission(material):
         return "emissive"
     return "opaque_shadow"
+
+
+def _auto_uv_from_world(world_co: Vector, world_no: Vector, scale: float = 0.1) -> tuple[float, float]:
+    """Synthesize export UVs when a mesh has no authored UVMap.
+
+    Many blockout meshes still lack UVs entirely. Without this, UV0/UV1 both
+    collapse to (0, 0), which makes textured materials look like a flat
+    fallback in OOTP. We project by dominant normal axis in world space so the
+    exporter stays non-destructive while producing usable tiled coordinates.
+    """
+    nx, ny, nz = abs(world_no.x), abs(world_no.y), abs(world_no.z)
+    if nz >= nx and nz >= ny:
+        return float(world_co.x * scale), float(world_co.y * scale)
+    if nx >= ny:
+        return float(world_co.y * scale), float(world_co.z * scale)
+    return float(world_co.x * scale), float(world_co.z * scale)
+
+
+def _uv_layer_is_degenerate(mesh: bpy.types.Mesh, uv_layer: bpy.types.MeshUVLoopLayer | None) -> bool:
+    """Return True if a UV layer exists but effectively contains no usable variation."""
+    if uv_layer is None or not mesh.loops:
+        return True
+    min_u = min_v = float("inf")
+    max_u = max_v = float("-inf")
+    first = None
+    varied = False
+    for item in uv_layer.data:
+        u = float(item.uv.x)
+        v = float(item.uv.y)
+        if first is None:
+            first = (u, v)
+        elif not varied and (abs(u - first[0]) > 1e-6 or abs(v - first[1]) > 1e-6):
+            varied = True
+        if u < min_u:
+            min_u = u
+        if v < min_v:
+            min_v = v
+        if u > max_u:
+            max_u = u
+        if v > max_v:
+            max_v = v
+    return (not varied) or (abs(max_u - min_u) < 1e-6 and abs(max_v - min_v) < 1e-6)
+
+
+def _uv_layer_is_degenerate_on_loops(uv_layer: bpy.types.MeshUVLoopLayer | None, loop_indices: list[int]) -> bool:
+    """Return True if a UV layer is effectively dead for one material's loop subset."""
+    if uv_layer is None or not loop_indices:
+        return True
+    min_u = min_v = float("inf")
+    max_u = max_v = float("-inf")
+    first = None
+    varied = False
+    for loop_index in loop_indices:
+        uv = uv_layer.data[loop_index].uv
+        u = float(uv.x)
+        v = float(uv.y)
+        if first is None:
+            first = (u, v)
+        elif not varied and (abs(u - first[0]) > 1e-6 or abs(v - first[1]) > 1e-6):
+            varied = True
+        if u < min_u:
+            min_u = u
+        if v < min_v:
+            min_v = v
+        if u > max_u:
+            max_u = u
+        if v > max_v:
+            max_v = v
+    return (not varied) or (abs(max_u - min_u) < 1e-6 and abs(max_v - min_v) < 1e-6)
+
+
+AUTO_SPLIT_MAX_TRIS = 30000
+
+
+def _split_mesh_record_by_triangle_budget(record: dict, max_tris: int = AUTO_SPLIT_MAX_TRIS) -> list[dict]:
+    """Split one oversized material submesh into several spatial chunks.
+
+    OOTP appears to render very large single-material submeshes unreliably at runtime.
+    Keep the same material assignment, but partition the mesh record into smaller chunks
+    before writing the POD scene.
+    """
+    indices = record.get("indices", [])
+    tri_count = len(indices) // 3
+    if tri_count <= max_tris:
+        return [record]
+
+    vertices = record["vertices"]
+    normals = record["normals"]
+    uv0 = record["uv0"]
+    uv1 = record["uv1"]
+
+    tris: list[tuple[tuple[int, int, int], tuple[float, float, float]]] = []
+    for i in range(0, len(indices), 3):
+        tri = (int(indices[i]), int(indices[i + 1]), int(indices[i + 2]))
+        va = vertices[tri[0]]
+        vb = vertices[tri[1]]
+        vc = vertices[tri[2]]
+        centroid = (
+            (va[0] + vb[0] + vc[0]) / 3.0,
+            (va[1] + vb[1] + vc[1]) / 3.0,
+            (va[2] + vb[2] + vc[2]) / 3.0,
+        )
+        tris.append((tri, centroid))
+
+    buckets: list[list[tuple[tuple[int, int, int], tuple[float, float, float]]]] = []
+
+    def recurse(items: list[tuple[tuple[int, int, int], tuple[float, float, float]]], depth: int = 0) -> None:
+        if len(items) <= max_tris or depth >= 12:
+            buckets.append(items)
+            return
+
+        mins = [min(item[1][axis] for item in items) for axis in range(3)]
+        maxs = [max(item[1][axis] for item in items) for axis in range(3)]
+        axis = max(range(3), key=lambda idx: maxs[idx] - mins[idx])
+        ordered = sorted(items, key=lambda item: item[1][axis])
+        mid = len(ordered) // 2
+        left = ordered[:mid]
+        right = ordered[mid:]
+        if not left or not right:
+            buckets.append(items)
+            return
+        recurse(left, depth + 1)
+        recurse(right, depth + 1)
+
+    recurse(tris)
+    if len(buckets) <= 1:
+        return [record]
+
+    out: list[dict] = []
+    width = max(2, len(str(len(buckets))))
+    for index, bucket in enumerate(buckets, start=1):
+        local_map: dict[int, int] = {}
+        part = {
+            "name": f"{record['name']}__part_{index:0{width}d}",
+            "material_name": record["material_name"],
+            "vertices": [],
+            "normals": [],
+            "uv0": [],
+            "uv1": [],
+            "indices": [],
+        }
+        for tri, _ in bucket:
+            for old_idx in tri:
+                if old_idx not in local_map:
+                    local_map[old_idx] = len(part["vertices"])
+                    part["vertices"].append(vertices[old_idx])
+                    part["normals"].append(normals[old_idx])
+                    part["uv0"].append(uv0[old_idx])
+                    part["uv1"].append(uv1[old_idx])
+                part["indices"].append(local_map[old_idx])
+        out.append(part)
+    return out
 
 
 def _collect_scene_meshes(context: bpy.types.Context, objects: list[bpy.types.Object]) -> tuple[list[dict], list[dict]]:
@@ -256,13 +554,14 @@ def _collect_scene_meshes(context: bpy.types.Context, objects: list[bpy.types.Ob
             uv0_name, uv1_name = _mesh_uv_layer_names(mesh)
             uv0_layer = mesh.uv_layers.get(uv0_name) if uv0_name else None
             uv1_layer = mesh.uv_layers.get(uv1_name) if uv1_name else None
-
             grouped: dict[int, dict] = {}
+            material_loop_indices: dict[int, list[int]] = {}
             # Per-group vertex deduplication: key = (pos, normal, uv0, uv1) → index
             vert_keys: dict[int, dict[tuple, int]] = {}
 
             for tri in mesh.loop_triangles:
                 mat_index = tri.material_index if tri.material_index < len(obj.material_slots) else 0
+                material_loop_indices.setdefault(mat_index, []).extend(tri.loops)
                 slot = obj.material_slots[mat_index] if mat_index < len(obj.material_slots) else None
                 material = slot.material if slot else None
                 material_name = material.name if material else "Material"
@@ -278,17 +577,55 @@ def _collect_scene_meshes(context: bpy.types.Context, objects: list[bpy.types.Ob
                     }
                     vert_keys[mat_index] = {}
 
+            uv_layers_by_mat: dict[int, tuple[bpy.types.MeshUVLoopLayer | None, bpy.types.MeshUVLoopLayer | None]] = {}
+            world_uv_by_mat: dict[int, tuple[bool, float]] = {}
+            for mat_index, loop_indices in material_loop_indices.items():
+                mat_uv0 = uv0_layer
+                mat_uv1 = uv1_layer
+                slot = obj.material_slots[mat_index] if mat_index < len(obj.material_slots) else None
+                material = slot.material if slot else None
+                force_world_uv = False
+                world_uv_scale = 0.1
+                if material is not None:
+                    force_world_uv = bool(_material_bool_override(material, "ootp_force_world_uv") or False)
+                    scale_override = _material_float_override(material, "ootp_world_uv_scale")
+                    if scale_override and scale_override > 0:
+                        world_uv_scale = float(scale_override)
+                if _uv_layer_is_degenerate_on_loops(mat_uv0, loop_indices):
+                    mat_uv0 = None
+                if _uv_layer_is_degenerate_on_loops(mat_uv1, loop_indices):
+                    mat_uv1 = None
+                if force_world_uv:
+                    mat_uv0 = None
+                    mat_uv1 = None
+                uv_layers_by_mat[mat_index] = (mat_uv0, mat_uv1)
+                world_uv_by_mat[mat_index] = (force_world_uv, world_uv_scale)
+
+            for tri in mesh.loop_triangles:
+                mat_index = tri.material_index if tri.material_index < len(obj.material_slots) else 0
                 record = grouped[mat_index]
                 key_map = vert_keys[mat_index]
+                mat_uv0, mat_uv1 = uv_layers_by_mat.get(mat_index, (None, None))
+                _, world_uv_scale = world_uv_by_mat.get(mat_index, (False, 0.1))
 
                 for loop_index in tri.loops:
-                    vertex_index = mesh.loops[loop_index].vertex_index
+                    loop = mesh.loops[loop_index]
+                    vertex_index = loop.vertex_index
                     vertex = mesh.vertices[vertex_index]
                     world_co = obj.matrix_world @ vertex.co
-                    world_no = _world_normal(obj, vertex.normal)
 
-                    uv0_val = tuple(uv0_layer.data[loop_index].uv) if uv0_layer else (0.0, 0.0)
-                    uv1_val = tuple(uv1_layer.data[loop_index].uv) if uv1_layer else uv0_val
+                    # Preserve split/custom normals so hard edges survive even when
+                    # many surfaces share the same atlas material.
+                    loop_normal = getattr(loop, "normal", None)
+                    source_normal = loop_normal if loop_normal is not None else vertex.normal
+                    world_no = _world_normal(obj, source_normal)
+
+                    uv0_val = (
+                        tuple(mat_uv0.data[loop_index].uv)
+                        if mat_uv0
+                        else _auto_uv_from_world(world_co, world_no, scale=world_uv_scale)
+                    )
+                    uv1_val = tuple(mat_uv1.data[loop_index].uv) if mat_uv1 else uv0_val
 
                     # Round to float32 precision for reliable deduplication of shared verts.
                     key: tuple = (
@@ -309,7 +646,7 @@ def _collect_scene_meshes(context: bpy.types.Context, objects: list[bpy.types.Ob
 
             for mat_index, record in grouped.items():
                 if record["indices"]:
-                    meshes_out.append(record)
+                    meshes_out.extend(_split_mesh_record_by_triangle_budget(record))
                 slot = obj.material_slots[mat_index] if mat_index < len(obj.material_slots) else None
                 material = slot.material if slot else None
                 if material and material.name not in seen_material_names:
@@ -335,7 +672,7 @@ def _hydrate_material_rows(context: bpy.types.Context, material_rows: list[dict]
         hydrated.append({
             "object": row["object"],
             "material": row["material"],
-            "template_material_name": _template_semantic_name(material.name),
+            "template_material_name": _material_template_name_override(material) or _template_semantic_name(material.name),
             "blend_mode": _material_blend_mode(material),
             "images": images,
         })
@@ -375,7 +712,10 @@ def export_current_scene_to_pod_package(
         for item in template_pod.parent.iterdir():
             if item.resolve() == template_pod.resolve():
                 continue
-            dest = output_dir / item.name
+            dest_name = item.name
+            if item.stem == template_pod.stem:
+                dest_name = f"{output_pod.stem}{item.suffix}"
+            dest = output_dir / dest_name
             if item.is_dir():
                 if item.name.lower() == "textures":
                     continue

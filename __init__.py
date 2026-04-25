@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 
 import bpy
-from bpy.props import BoolProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, PointerProperty, StringProperty
 from bpy.types import AddonPreferences, Operator, Panel
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
@@ -25,6 +25,17 @@ ADDON_PACKAGE = __package__ or Path(__file__).resolve().parent.name
 ADDON_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = ADDON_DIR.parents[2]
 DEFAULT_EXPORT_DIR = WORKSPACE_ROOT / "temp" / "parkforge_exports"
+
+MATERIAL_EXPORT_MODE_ITEMS = (
+    ("AUTO", "Auto", "Infer the OOTP export mode from the material"),
+    ("GROUND", "Ground", "Use OOTP ground shader (ground.pfx / grass_new)"),
+    ("OPAQUE_SHADOW", "Opaque Shadow", "Opaque structure material with shadow/lightmap support"),
+    ("ALPHA_SHADOW", "Alpha Shadow", "Alpha-cut material with shadow/lightmap support"),
+    ("ALPHA_BLEND", "Alpha Blend", "Alpha-blended material"),
+    ("EMISSIVE", "Emissive", "Emissive screen/signage material"),
+    ("STOCK_BACKGROUND", "Stock Background", "Use stock background template material"),
+    ("STOCK_LIGHTING", "Stock Lighting", "Use stock lighting template material"),
+)
 
 
 def _iter_ootp_install_roots() -> list[Path]:
@@ -91,8 +102,9 @@ def _resolve_template_pod_path(raw_path: str, context: bpy.types.Context | None 
 
 def _normalize_output_pod_path(output_path: str | Path, template_pod: Path) -> Path:
     output = Path(output_path)
-    suffix = output.suffix if output.suffix.lower() == ".pod" else ".pod"
-    return output.with_name(f"{template_pod.stem}{suffix}")
+    if output.suffix.lower() != ".pod":
+        return output.with_suffix(".pod")
+    return output
 
 
 class OOTP_POD_AddonPreferences(AddonPreferences):
@@ -322,6 +334,36 @@ class VIEW3D_PT_ootp_pod_tools(Panel):
             col.prop(scene, "ootp_pod_compressonator_cli_path", text="CLI Override")
 
 
+class MATERIAL_PT_ootp_pod_material(Panel):
+    bl_label = "OOTP ParkForge Export"
+    bl_idname = "MATERIAL_PT_ootp_pod_material"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "material"
+
+    @classmethod
+    def poll(cls, context):
+        return context.material is not None
+
+    def draw(self, context):
+        layout = self.layout
+        mat = context.material
+
+        col = layout.column(align=True)
+        col.prop(mat, "ootp_export_mode", text="Mode")
+        col.prop(mat, "ootp_template_material_name", text="Template Name")
+
+        box = layout.box()
+        box.label(text="Texture Overrides")
+        box.prop(mat, "ootp_primary_image", text="Primary")
+        box.prop(mat, "ootp_secondary_image", text="Secondary")
+
+        info = layout.box()
+        info.label(text="Leave blank to auto-detect from nodes.", icon="INFO")
+        if getattr(mat, "ootp_export_mode", "AUTO") == "GROUND":
+            info.label(text="Ground mode uses Secondary as the ground detail image.")
+
+
 def menu_func_import(self, _context):
     self.layout.operator(IMPORT_SCENE_OT_ootp_pod.bl_idname, text="OOTP ParkForge POD (.pod)")
 
@@ -337,6 +379,7 @@ classes = (
     EXPORT_SCENE_OT_ootp_pod_package,
     EXPORT_SCENE_OT_ootp_pod_package_quick,
     VIEW3D_PT_ootp_pod_tools,
+    MATERIAL_PT_ootp_pod_material,
 )
 
 
@@ -367,6 +410,27 @@ def register():
         description="Optional per-scene override path to compressonatorcli.exe for KTX decoding",
         subtype="FILE_PATH",
     )
+    bpy.types.Material.ootp_export_mode = EnumProperty(
+        name="OOTP Export Mode",
+        description="Override how this material exports to OOTP",
+        items=MATERIAL_EXPORT_MODE_ITEMS,
+        default="AUTO",
+    )
+    bpy.types.Material.ootp_template_material_name = StringProperty(
+        name="OOTP Template Name",
+        description="Optional template material name override used by the exporter",
+        default="",
+    )
+    bpy.types.Material.ootp_primary_image = PointerProperty(
+        name="OOTP Primary Image",
+        description="Optional explicit primary image override used for diffuse export",
+        type=bpy.types.Image,
+    )
+    bpy.types.Material.ootp_secondary_image = PointerProperty(
+        name="OOTP Secondary Image",
+        description="Optional explicit secondary image override used for ground/lightmap export",
+        type=bpy.types.Image,
+    )
 
     for cls in classes:
         bpy.utils.register_class(cls)
@@ -380,6 +444,10 @@ def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 
+    del bpy.types.Material.ootp_secondary_image
+    del bpy.types.Material.ootp_primary_image
+    del bpy.types.Material.ootp_template_material_name
+    del bpy.types.Material.ootp_export_mode
     del bpy.types.Scene.ootp_pod_compressonator_cli_path
     del bpy.types.Scene.ootp_pod_copy_sidecars
     del bpy.types.Scene.ootp_pod_selected_only

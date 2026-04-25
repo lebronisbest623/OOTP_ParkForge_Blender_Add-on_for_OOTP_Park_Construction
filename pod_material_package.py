@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import subprocess
 import sys
 import struct
 import zlib
@@ -71,6 +72,132 @@ def _copy_texture(src_path: str, textures_dir: Path, used_names: set[str]) -> st
     dst = textures_dir / candidate
     shutil.copy2(src, dst)
     return f"textures/{candidate}"
+
+
+def _looks_like_compressonator(path: Path) -> bool:
+    if not path.exists() or path.name.lower() != "compressonatorcli.exe":
+        return False
+    sidecars = (
+        path.with_name("ktx.dll"),
+        path.with_name("qt.conf"),
+        path.parent / "license",
+    )
+    return any(item.exists() for item in sidecars)
+
+
+def _find_compressonator_cli() -> Path | None:
+    env_names = ("OOTP_POD_COMPRESSONATOR", "COMPRESSONATORCLI_PATH")
+    for env_name in env_names:
+        value = Path(str(Path.cwd()))  # dummy init to satisfy type checker
+        raw = None
+        try:
+            import os
+            raw = os.environ.get(env_name)
+        except Exception:
+            raw = None
+        if raw:
+            candidate = Path(raw)
+            if _looks_like_compressonator(candidate):
+                return candidate
+
+    candidates: list[Path] = []
+    try:
+        import shutil as _shutil
+        for exe_name in ("compressonatorcli.exe", "CompressonatorCLI.exe"):
+            which_path = _shutil.which(exe_name)
+            if which_path:
+                candidates.append(Path(which_path))
+    except Exception:
+        pass
+
+    documents = Path.home() / "Documents"
+    if documents.exists():
+        try:
+            candidates.extend(
+                documents.glob(
+                    "Out of the Park Developments/OOTP Baseball */saved_games/*/tools/compressonatorcli/**/compressonatorcli.exe"
+                )
+            )
+        except Exception:
+            pass
+
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if _looks_like_compressonator(resolved):
+            return resolved
+    return None
+
+
+def _image_has_alpha(path: Path) -> bool:
+    if Image is None:
+        return True
+    try:
+        img = Image.open(path).convert("RGBA")
+        alpha = img.getchannel("A")
+        lo, hi = alpha.getextrema()
+        return lo < 255 or hi < 255
+    except Exception:
+        return True
+
+
+def _write_rgb_temp(src: Path, dst: Path) -> Path:
+    if Image is None:
+        raise PODMaterialPackageError("Pillow is required to convert RGBA PNGs to RGB for ETC2_RGB output")
+    img = Image.open(src).convert("RGB")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    img.save(dst, format="PNG")
+    return dst
+
+
+def _encode_ktx_with_compressonator(
+    src_path: str | Path,
+    out_dir: Path,
+    out_name: str,
+    fmt: str,
+    *,
+    drop_alpha: bool = False,
+) -> str:
+    cli = _find_compressonator_cli()
+    if cli is None:
+        raise PODMaterialPackageError("CompressonatorCLI not found for stock KTX export")
+
+    src = Path(src_path)
+    if not src.exists():
+        raise PODMaterialPackageError(f"Texture source not found for KTX encode: {src}")
+
+    encode_src = src
+    temp_rgb_path = None
+    if drop_alpha:
+        temp_rgb_path = out_dir / f"_{Path(out_name).stem}_rgb_tmp.png"
+        encode_src = _write_rgb_temp(src, temp_rgb_path)
+
+    dst = out_dir / out_name
+    command = [str(cli), "-nomipmap", "-fd", fmt, str(encode_src), str(dst)]
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if temp_rgb_path and temp_rgb_path.exists():
+        try:
+            temp_rgb_path.unlink()
+        except Exception:
+            pass
+    if completed.returncode != 0 or not dst.exists():
+        raise PODMaterialPackageError(
+            f"CompressonatorCLI failed for {src} -> {dst} ({fmt}): {completed.stderr or completed.stdout}"
+        )
+    return out_name
 
 
 def _write_white_lightmap(textures_dir: Path) -> str:
@@ -291,6 +418,46 @@ def _pfx_screen_text(diffuse_rel: str) -> str:
     )
 
 
+def _first_image_by_role(images: list[dict], *roles: str) -> dict | None:
+    wanted = {role.lower() for role in roles}
+    for entry in images:
+        if not entry.get("filepath"):
+            continue
+        role = str(entry.get("role", "")).lower()
+        if role in wanted:
+            return entry
+    return None
+
+
+
+def _first_distinct_image(images: list[dict], used_entry: dict | None) -> dict | None:
+    used_path = None if used_entry is None else used_entry.get("filepath")
+    for entry in images:
+        path = entry.get("filepath")
+        if not path:
+            continue
+        if used_path and path == used_path:
+            continue
+        return entry
+    return None
+
+
+def _first_distinct_image_by_role(images: list[dict], used_entry: dict | None, *roles: str) -> dict | None:
+    used_path = None if used_entry is None else used_entry.get("filepath")
+    wanted = {role.lower() for role in roles}
+    for entry in images:
+        path = entry.get("filepath")
+        if not path:
+            continue
+        if used_path and path == used_path:
+            continue
+        role = str(entry.get("role", "")).lower()
+        if role in wanted:
+            return entry
+    return None
+
+
+
 def build_material_package(material_dump: list[dict] | str | Path, output_dir: str | Path) -> dict:
     if isinstance(material_dump, (str, Path)):
         dump = json.loads(Path(material_dump).read_text(encoding="utf-8"))
@@ -320,6 +487,7 @@ def build_material_package(material_dump: list[dict] | str | Path, output_dir: s
             dedup[material_name] = {
                 "object": object_name,
                 "material": material_name,
+                "template_material_name": row.get("template_material_name", material_name),
                 "blend_mode": row.get("blend_mode", "opaque_shadow"),
                 "images": images,
             }
@@ -331,14 +499,22 @@ def build_material_package(material_dump: list[dict] | str | Path, output_dir: s
         images = row["images"]
         if not images:
             raise PODMaterialPackageError(f"Material {material_name} has no image textures")
-        diffuse_source = images[0]["filepath"]
+        diffuse_entry = (
+            _first_image_by_role(images, "diffuse", "emissive", "generic")
+            or _first_image_by_role(images, "lightmap")
+            or _first_distinct_image(images, None)
+        )
+        if diffuse_entry is None:
+            raise PODMaterialPackageError(f"Material {material_name} has no usable diffuse texture")
+        diffuse_source = diffuse_entry["filepath"]
         diffuse_rel = _copy_texture(diffuse_source, textures_dir, used_names)
         mode = row.get("blend_mode", "opaque_shadow")
         secondary_rel = None
         tertiary_rel = None
         if mode in ("opaque_shadow", "alpha_shadow", "alpha_blend"):
-            if len(images) > 1 and images[1].get("filepath"):
-                secondary_rel = _copy_texture(images[1]["filepath"], textures_dir, used_names)
+            secondary_entry = _first_image_by_role(images, "secondary", "lightmap", "shadow")
+            if secondary_entry and secondary_entry.get("filepath"):
+                secondary_rel = _copy_texture(secondary_entry["filepath"], textures_dir, used_names)
             else:
                 secondary_rel = white_lm
         pfx_filename = None
@@ -346,8 +522,12 @@ def build_material_package(material_dump: list[dict] | str | Path, output_dir: s
         if mode == "ground":
             pfx_filename = "ground.pfx"
             effect_name = "grass_new"
-            if len(images) > 1 and images[1].get("filepath"):
-                secondary_rel = _copy_texture(images[1]["filepath"], textures_dir, used_names)
+            ground_entry = (
+                _first_image_by_role(images, "secondary", "ground", "ground_secondary")
+                or _first_distinct_image_by_role(images, diffuse_entry, "diffuse", "generic")
+            )
+            if ground_entry and ground_entry.get("filepath"):
+                secondary_rel = _copy_texture(ground_entry["filepath"], textures_dir, used_names)
             else:
                 secondary_rel = diffuse_rel
             tertiary_rel = "../misc/grass/dirt.png"
@@ -369,28 +549,58 @@ def build_material_package(material_dump: list[dict] | str | Path, output_dir: s
             # exporting it as a generic alpha-shadow material causes lights to
             # render as dark cards or disappear entirely.
             #
-            # OOTP stock parks also reference Stand_Lighting textures by plain
-            # filename at the package root rather than through textures/... .
-            # Keep a top-level copy and point the material at that plain name
-            # so the exported package behaves like the stock stadium.
-            plain_name = Path(diffuse_rel).name
-            src = textures_dir / plain_name
-            dst = out_dir / plain_name
-            if src.exists():
-                shutil.copy2(src, dst)
-            diffuse_rel = plain_name
+            # Stand_Lighting appears to be more sensitive than other stock
+            # materials to the canonical plain filenames used by OOTP stock
+            # parks. Normalize exports to the stock naming convention so the
+            # runtime sees the expected day/night pair:
+            #   Stand_Lighting_day.png
+            #   Stand_Lighting_night.png
+            day_name = _encode_ktx_with_compressonator(
+                textures_dir / Path(diffuse_rel).name,
+                out_dir,
+                "Stand_Lighting_day.ktx",
+                "ETC2_RGBA",
+            )
+            diffuse_rel = day_name
+
+            secondary_entry = _first_image_by_role(images, "secondary", "lightmap", "shadow")
+            if secondary_entry and secondary_entry.get("filepath"):
+                sec_rel = _copy_texture(secondary_entry["filepath"], textures_dir, used_names)
+                _encode_ktx_with_compressonator(
+                    textures_dir / Path(sec_rel).name,
+                    out_dir,
+                    "Stand_Lighting_night.ktx",
+                    "ETC2_RGB",
+                )
             secondary_rel = None
         elif mode == "stock_background":
             # Background behaves like a stock panorama card in OOTP parks.
             # Keep the exact template material block and reference the
             # diffuse texture by plain top-level filename rather than
             # textures/... so day/night transitions resolve like the stock park.
-            plain_name = Path(diffuse_rel).name
-            src = textures_dir / plain_name
-            dst = out_dir / plain_name
-            if src.exists():
-                shutil.copy2(src, dst)
-            diffuse_rel = plain_name
+            diffuse_src = textures_dir / Path(diffuse_rel).name
+            diffuse_rel = _encode_ktx_with_compressonator(
+                diffuse_src,
+                out_dir,
+                "Background_day.ktx",
+                "ETC2_RGBA",
+            )
+            secondary_entry = _first_distinct_image_by_role(images, None, "secondary", "lightmap", "shadow", "ground", "ground_secondary")
+            if secondary_entry and secondary_entry.get("filepath"):
+                sec_rel = _copy_texture(secondary_entry["filepath"], textures_dir, used_names)
+                _encode_ktx_with_compressonator(
+                    textures_dir / Path(sec_rel).name,
+                    out_dir,
+                    "Background_night.ktx",
+                    "ETC2_RGBA",
+                )
+            else:
+                _encode_ktx_with_compressonator(
+                    diffuse_src,
+                    out_dir,
+                    "Background_night.ktx",
+                    "ETC2_RGBA",
+                )
             secondary_rel = None
         elif mode in ("opaque_shadow", "alpha_shadow", "alpha_blend"):
             pfx_filename = f"{safe_name}.pfx"
