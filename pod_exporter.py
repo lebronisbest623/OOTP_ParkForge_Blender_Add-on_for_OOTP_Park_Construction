@@ -110,12 +110,32 @@ def _resolve_image_path(image: bpy.types.Image, generated_dir: Path) -> Path | N
     return None
 
 
+_IMAGE_ROLE_PRIORITY = {
+    "generic": 0,
+    "auxiliary": 0,
+    "diffuse": 1,
+    "emissive": 1,
+    "ground": 2,
+    "ground_secondary": 2,
+    "secondary": 3,
+    "lightmap": 3,
+    "shadow": 3,
+    "secondary_night": 4,
+}
+
+
 def _append_resolved_image_entry(images: list[dict], seen: set[str], image: bpy.types.Image, generated_dir: Path, role: str) -> None:
     image_path = _resolve_image_path(image, generated_dir)
     if image_path is None:
         return
     key = str(image_path).lower()
     if key in seen:
+        for entry in images:
+            if str(entry.get("filepath", "")).lower() == key:
+                old_role = str(entry.get("role", "generic"))
+                if _IMAGE_ROLE_PRIORITY.get(role, 0) > _IMAGE_ROLE_PRIORITY.get(old_role, 0):
+                    entry["role"] = role
+                break
         return
     seen.add(key)
     images.append({"name": image.name, "filepath": str(image_path), "role": role})
@@ -165,7 +185,16 @@ def _image_role_from_identity(node_name: str, image_name: str, image_path: str) 
 def _collect_socket_image_entries(socket, generated_dir: Path, images: list[dict], seen: set[str], role: str) -> None:
     for node in _iter_upstream_nodes_from_socket(socket):
         if node.type == "TEX_IMAGE" and getattr(node, "image", None):
-            _append_resolved_image_entry(images, seen, node.image, generated_dir, role)
+            node_role = role
+            if role in {"diffuse", "generic"}:
+                detected_role = _image_role_from_identity(
+                    node.name,
+                    node.image.name,
+                    str(node.image.filepath_raw or node.image.filepath or ""),
+                )
+                if detected_role != "generic":
+                    node_role = detected_role
+            _append_resolved_image_entry(images, seen, node.image, generated_dir, node_role)
 
 
 
@@ -176,13 +205,24 @@ def _material_image_override(material: bpy.types.Material, attr_name: str):
     return None
 
 
+def _has_image_role(images: list[dict], *roles: str) -> bool:
+    wanted = {role.lower() for role in roles}
+    for entry in images:
+        if str(entry.get("role", "")).lower() in wanted and entry.get("filepath"):
+            return True
+    return False
+
+
 def _material_explicit_image_entries(material: bpy.types.Material, generated_dir: Path, images: list[dict], seen: set[str]) -> None:
     primary = _material_image_override(material, "ootp_primary_image")
     secondary = _material_image_override(material, "ootp_secondary_image")
-    if primary is not None:
+    secondary_night = _material_image_override(material, "ootp_secondary_night_image")
+    if primary is not None and not _has_image_role(images, "diffuse", "emissive", "generic"):
         _append_resolved_image_entry(images, seen, primary, generated_dir, "diffuse")
-    if secondary is not None:
+    if secondary is not None and not _has_image_role(images, "secondary", "lightmap", "shadow"):
         _append_resolved_image_entry(images, seen, secondary, generated_dir, "secondary")
+    if secondary_night is not None and not _has_image_role(images, "secondary_night"):
+        _append_resolved_image_entry(images, seen, secondary_night, generated_dir, "secondary_night")
 
 
 def _material_image_entries(material: bpy.types.Material, generated_dir: Path) -> list[dict]:
@@ -191,7 +231,6 @@ def _material_image_entries(material: bpy.types.Material, generated_dir: Path) -
 
     images: list[dict] = []
     seen: set[str] = set()
-    _material_explicit_image_entries(material, generated_dir, images, seen)
 
     for output in _material_output_nodes(material):
         surface_socket = output.inputs.get("Surface")
@@ -208,6 +247,10 @@ def _material_image_entries(material: bpy.types.Material, generated_dir: Path) -
             continue
         role = _image_role_from_identity(node.name, node.image.name, str(node.image.filepath_raw or node.image.filepath or ""))
         _append_resolved_image_entry(images, seen, node.image, generated_dir, role)
+    # Explicit export image fields are fallback slots. The live Blender node
+    # graph should win when the artist has changed a material texture, otherwise
+    # stale pointer properties can export an older cached texture.
+    _material_explicit_image_entries(material, generated_dir, images, seen)
     return images
 
 
@@ -674,6 +717,7 @@ def _hydrate_material_rows(context: bpy.types.Context, material_rows: list[dict]
             "material": row["material"],
             "template_material_name": _material_template_name_override(material) or _template_semantic_name(material.name),
             "blend_mode": _material_blend_mode(material),
+            "alpha_discard_threshold": _material_float_override(material, "ootp_alpha_discard_threshold"),
             "images": images,
         })
     return hydrated

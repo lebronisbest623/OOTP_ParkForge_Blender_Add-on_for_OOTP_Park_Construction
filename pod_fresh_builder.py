@@ -265,6 +265,8 @@ def _build_material_from_exact_template(
     name: str,
     diffuse_index: int,
     secondary_index: int | None,
+    pfx_filename: str | None = None,
+    effect_name: str | None = None,
 ) -> PODBlock:
     block = _clone_block(template_block)
     _set_child_payload(block, PODIdentifiers.e_materialName, _pack_cstr(name))
@@ -274,6 +276,10 @@ def _build_material_from_exact_template(
         PODIdentifiers.e_materialSecondaryTextureIndex,
         _pack_i32(-1 if secondary_index is None else secondary_index),
     )
+    if pfx_filename is not None:
+        _set_child_payload(block, PODIdentifiers.e_materialPfxFilename, _pack_cstr(pfx_filename))
+    if effect_name is not None:
+        _set_child_payload(block, PODIdentifiers.e_materialEffectName, _pack_cstr(effect_name))
     return block
 
 
@@ -336,12 +342,19 @@ def _build_materials_and_textures_from_spec(
         # This keeps hidden blend/state flags and stock rendering behavior intact
         # for stadium-sensitive materials like Stand, Spectator, Lighting, and ADs.
         if exact_template is not None:
+            # Preserve stock material shader state only when the exported
+            # material is actually the same stock material.  If a custom
+            # material merely borrows a stock template (for example a renamed
+            # net using Alphatest), point the POD at the generated custom PFX.
+            preserve_stock_pfx = _material_name_from_block(exact_template) == name
             material_blocks.append(
                 _build_material_from_exact_template(
                     exact_template,
                     name,
                     diffuse_index,
                     secondary_index,
+                    pfx_filename=None if preserve_stock_pfx else spec.get("pfx_filename"),
+                    effect_name=None if preserve_stock_pfx else spec.get("effect_name"),
                 )
             )
         else:

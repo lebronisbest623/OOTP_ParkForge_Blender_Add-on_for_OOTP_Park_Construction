@@ -56,10 +56,26 @@ def _canonical_texture_filename(src: Path) -> str:
     return f"{stem}{ext}"
 
 
-def _copy_texture(src_path: str, textures_dir: Path, used_names: set[str]) -> str:
+def _texture_source_key(src: Path) -> str:
+    try:
+        return str(src.resolve()).lower()
+    except Exception:
+        return str(src.absolute()).lower()
+
+
+def _copy_texture(
+    src_path: str,
+    textures_dir: Path,
+    used_names: set[str],
+    copied_sources: dict[str, str] | None = None,
+) -> str:
     src = Path(src_path)
     if not src.exists():
         raise PODMaterialPackageError(f"Texture source not found: {src}")
+    key = _texture_source_key(src)
+    if copied_sources is not None and key in copied_sources:
+        return copied_sources[key]
+
     candidate = _canonical_texture_filename(src)
     serial = 1
     while candidate.lower() in used_names:
@@ -70,8 +86,12 @@ def _copy_texture(src_path: str, textures_dir: Path, used_names: set[str]) -> st
         serial += 1
     used_names.add(candidate.lower())
     dst = textures_dir / candidate
-    shutil.copy2(src, dst)
-    return f"textures/{candidate}"
+    if _texture_source_key(src) != _texture_source_key(dst):
+        shutil.copy2(src, dst)
+    rel = f"textures/{candidate}"
+    if copied_sources is not None:
+        copied_sources[key] = rel
+    return rel
 
 
 def _looks_like_compressonator(path: Path) -> bool:
@@ -197,7 +217,59 @@ def _encode_ktx_with_compressonator(
         raise PODMaterialPackageError(
             f"CompressonatorCLI failed for {src} -> {dst} ({fmt}): {completed.stderr or completed.stdout}"
         )
+    _normalize_ktx_for_ootp(dst, fmt)
     return out_name
+
+
+def _normalize_ktx_for_ootp(path: Path, fmt: str) -> None:
+    """Match the small KTX header details used by shipped OOTP textures."""
+    data = path.read_bytes()
+    signature = b"\xabKTX 11\xbb\r\n\x1a\n"
+    if not data.startswith(signature) or len(data) < 68:
+        return
+
+    values = list(struct.unpack("<13I", data[12:64]))
+    bytes_of_key_value_data = values[12]
+    orientation = b"\x17\x00\x00\x00KTXorientation\x00S=r,T=d\x00\x00"
+
+    if fmt.upper() == "ETC2_RGB":
+        values[5] = 6407  # glBaseInternalFormat = GL_RGB
+    elif fmt.upper() == "ETC2_RGBA":
+        values[5] = 6408  # glBaseInternalFormat = GL_RGBA
+
+    header = signature + struct.pack("<13I", *values)
+    payload = data[64 + bytes_of_key_value_data:]
+    if bytes_of_key_value_data != len(orientation):
+        values[12] = len(orientation)
+        header = signature + struct.pack("<13I", *values)
+        data = header + orientation + payload
+    else:
+        data = header + data[64:]
+    path.write_bytes(data)
+
+
+def _decode_ktx_with_compressonator(src_path: str | Path, dst_path: str | Path) -> Path | None:
+    cli = _find_compressonator_cli()
+    if cli is None:
+        return None
+
+    src = Path(src_path)
+    dst = Path(dst_path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    command = [str(cli), str(src), str(dst)]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0 or not dst.exists():
+        return None
+    return dst
 
 
 def _write_white_lightmap(textures_dir: Path) -> str:
@@ -210,6 +282,18 @@ def _write_white_lightmap(textures_dir: Path) -> str:
     else:
         _write_png_rgba(dst, 1, 1, [bytes((255, 255, 255, 255))])
     return f"textures/{name}"
+
+
+def _ensure_stock_alpha_lightmap(out_dir: Path) -> str:
+    name = "Spectator_LM_day.png"
+    dst = out_dir / name
+    if not dst.exists():
+        row = bytes((255, 255, 255, 255)) * 1024
+        _write_png_rgba(dst, 1024, 1024, [row] * 1024)
+    ktx = out_dir / "Spectator_LM_day.ktx"
+    if not ktx.exists():
+        _encode_ktx_with_compressonator(dst, out_dir, "Spectator_LM_day.ktx", "ETC2_RGB")
+    return name
 
 
 _PFX_VERTEX_SHADER = """\
@@ -320,8 +404,20 @@ def _pfx_grass_text(diffuse_rel: str, ground_rel: str, dirt_rel: str) -> str:
     )
 
 
-def _pfx_lightmap_text(diffuse_rel: str, secondary_rel: str, *, alpha_cut: bool, effect_name: str) -> str:
-    discard_line = "\tif(texture2D(texUnit0, v_texcoord)[3]<0.1) discard;" if alpha_cut else ""
+def _pfx_lightmap_text(
+    diffuse_rel: str,
+    secondary_rel: str,
+    *,
+    alpha_cut: bool,
+    effect_name: str,
+    force_alpha_opaque: bool = False,
+    alpha_discard_threshold: float = 0.1,
+) -> str:
+    discard_line = (
+        f"\tif(texture2D(texUnit0, v_texcoord)[3]<{alpha_discard_threshold:.6g}) discard;"
+        if alpha_cut
+        else ""
+    )
     frag_body = _PFX_FRAGMENT_SHADER_BODY % {"discard_line": discard_line}
     return (
         "[HEADER]\n"
@@ -457,6 +553,204 @@ def _first_distinct_image_by_role(images: list[dict], used_entry: dict | None, *
     return None
 
 
+def _is_spectator_template_name(name: str) -> bool:
+    return _sanitize_name(name).lower().startswith("spectator")
+
+
+def _copy_stock_day_night_pair(
+    src_path: str | Path,
+    out_dir: Path,
+    stem_base: str,
+    *,
+    fmt: str = "ETC2_RGB",
+    night_src_path: str | Path | None = None,
+) -> tuple[str, str]:
+    src = Path(src_path)
+    if not src.exists():
+        raise PODMaterialPackageError(f"Texture source not found for stock day/night pair: {src}")
+
+    day_png_name = f"{stem_base}_day.png"
+    night_png_name = f"{stem_base}_night.png"
+    day_png = out_dir / day_png_name
+    night_png = out_dir / night_png_name
+
+    shutil.copy2(src, day_png)
+
+    night_src = Path(night_src_path) if night_src_path else src.with_name(
+        src.name.replace("_day_", "_night_").replace("_day.", "_night.")
+    )
+    if night_src.exists() and night_src != src:
+        shutil.copy2(night_src, night_png)
+    else:
+        shutil.copy2(src, night_png)
+
+    _encode_ktx_with_compressonator(day_png, out_dir, f"{stem_base}_day.ktx", fmt)
+    _encode_ktx_with_compressonator(night_png, out_dir, f"{stem_base}_night.ktx", fmt)
+    return day_png_name, night_png_name
+
+
+def _copy_spectator_stock_diffuse(src_path: str | Path, out_dir: Path) -> tuple[str, str]:
+    """Write spectator diffuse as a real PNG for custom exported parks.
+
+    Stock parks can rely on OOTP resolving *.png names to shipped *.ktx
+    sidecars.  In exported custom parks that alias is less reliable, so
+    decode spectator KTX sources to the exact PNG path referenced by both
+    the POD material block and the PFX.
+    """
+    src = Path(src_path)
+    if not src.exists():
+        raise PODMaterialPackageError(f"Texture source not found for spectator diffuse: {src}")
+
+    safe_stem = _sanitize_name(src.stem)
+    png_ref_name = f"{safe_stem}.png"
+    ktx_ref_name = f"{safe_stem}.ktx"
+    pod_ref = f"textures/{png_ref_name}"
+    dst_png = out_dir / pod_ref
+
+    if src.suffix.lower() == ".ktx":
+        decoded = _decode_ktx_with_compressonator(src, dst_png)
+        if decoded is None:
+            dst_ktx = out_dir / "textures" / ktx_ref_name
+            if _texture_source_key(src) != _texture_source_key(dst_ktx):
+                shutil.copy2(src, dst_ktx)
+    elif _texture_source_key(src) != _texture_source_key(dst_png):
+        shutil.copy2(src, dst_png)
+
+    if dst_png.exists():
+        _write_spectator_safe_diffuse(src, dst_png)
+        _encode_ktx_with_compressonator(dst_png, out_dir / "textures", ktx_ref_name, "ETC2_RGBA")
+
+    return pod_ref, pod_ref
+
+
+def _write_spectator_safe_diffuse(src: Path, dst_png: Path) -> None:
+    """Replace dark C2U spectator RGB with visible stock seating color.
+
+    OOTP's spectator C2U files carry a useful alpha mask, but their RGB can be
+    near black in the UV bands our exported spectator mesh uses.  Stock parks
+    keep a matching seating_popularity2_<color>.jpg beside the C2U KTX; use that
+    image for color and turn the C2U mask into binary alpha so OOTP cannot
+    blend low-alpha pixels into black.
+    """
+    color_stem = src.stem
+    if color_stem.lower().endswith("_c2u"):
+        color_stem = color_stem[:-4]
+    color_src = src.with_name(f"{color_stem}.jpg")
+    if Image is None:
+        _write_spectator_safe_diffuse_with_blender(color_src, dst_png)
+        return
+
+    try:
+        mask_img = Image.open(dst_png).convert("RGBA")
+        if color_src.exists():
+            color_img = Image.open(color_src).convert("RGB").resize(mask_img.size)
+            rgb = color_img
+        else:
+            # Fallback for non-stock custom spectator textures: lift the copied
+            # RGB enough that alpha-tested cards do not collapse into black.
+            import numpy as np
+
+            arr = np.array(mask_img, dtype=np.float32)
+            rgb_arr = arr[:, :, :3]
+            rgb_arr = np.maximum(rgb_arr * 1.6 + 32.0, 72.0)
+            arr[:, :, :3] = np.clip(rgb_arr, 0, 255)
+            arr[:, :, 3] = np.where(arr[:, :, 3] >= 26.0, 255.0, 0.0)
+            Image.fromarray(arr.astype("uint8"), "RGBA").save(dst_png, format="PNG")
+            return
+
+        out = Image.new("RGBA", mask_img.size)
+        out.paste(rgb)
+        out.putalpha(mask_img.getchannel("A").point(lambda a: 255 if a >= 26 else 0))
+        out.save(dst_png, format="PNG")
+    except Exception:
+        return
+
+
+def _write_spectator_safe_diffuse_with_blender(color_src: Path, dst_png: Path) -> None:
+    if not color_src.exists():
+        return
+    try:
+        import bpy  # type: ignore
+        from array import array
+    except Exception:
+        return
+
+    mask_img = None
+    color_img = None
+    out_img = None
+    try:
+        mask_img = bpy.data.images.load(str(dst_png), check_existing=False)
+        color_img = bpy.data.images.load(str(color_src), check_existing=False)
+        width, height = int(mask_img.size[0]), int(mask_img.size[1])
+        if width <= 0 or height <= 0:
+            return
+        if int(color_img.size[0]) != width or int(color_img.size[1]) != height:
+            color_img.scale(width, height)
+
+        count = width * height * 4
+        mask_pixels = array("f", [0.0]) * count
+        color_pixels = array("f", [0.0]) * count
+        out_pixels = array("f", [0.0]) * count
+        mask_img.pixels.foreach_get(mask_pixels)
+        color_img.pixels.foreach_get(color_pixels)
+
+        for i in range(0, count, 4):
+            out_pixels[i] = color_pixels[i]
+            out_pixels[i + 1] = color_pixels[i + 1]
+            out_pixels[i + 2] = color_pixels[i + 2]
+            out_pixels[i + 3] = 1.0 if mask_pixels[i + 3] >= (26.0 / 255.0) else 0.0
+
+        out_img = bpy.data.images.new("_parkforge_spectator_safe_diffuse", width, height, alpha=True)
+        out_img.pixels.foreach_set(out_pixels)
+        out_img.filepath_raw = str(dst_png)
+        out_img.file_format = "PNG"
+        out_img.save()
+    except Exception:
+        return
+    finally:
+        for img in (mask_img, color_img, out_img):
+            if img is not None:
+                try:
+                    bpy.data.images.remove(img)
+                except Exception:
+                    pass
+
+
+def _write_spectator_lightmap_pair(
+    day_src_path: str | Path,
+    out_dir: Path,
+    *,
+    night_src_path: str | Path | None = None,
+    stem_base: str = "Spectator_LM",
+) -> tuple[str, str]:
+    if stem_base == "Spectator_LM":
+        day_ktx = out_dir / "Spectator_LM_day.ktx"
+        night_ktx = out_dir / "Spectator_LM_night.ktx"
+        if day_ktx.exists() and night_ktx.exists() and day_ktx.stat().st_size >= 500_000 and night_ktx.stat().st_size >= 500_000:
+            _normalize_ktx_for_ootp(day_ktx, "ETC2_RGB")
+            _normalize_ktx_for_ootp(night_ktx, "ETC2_RGB")
+            return "Spectator_LM_day.png", "Spectator_LM_night.png"
+
+    def copy_or_flat(src_path: str | Path | None, dst_name: str, fallback: tuple[int, int, int]) -> Path:
+        dst = out_dir / dst_name
+        src = Path(src_path) if src_path else None
+        if src and src.exists():
+            if _texture_source_key(src) != _texture_source_key(dst):
+                shutil.copy2(src, dst)
+            return dst
+
+        row = bytes((*fallback, 255)) * 1024
+        _write_png_rgba(dst, 1024, 1024, [row] * 1024)
+        return dst
+
+    day_png = copy_or_flat(day_src_path, f"{stem_base}_day.png", (226, 226, 226))
+    night_png = copy_or_flat(night_src_path, f"{stem_base}_night.png", (80, 80, 88))
+
+    _encode_ktx_with_compressonator(day_png, out_dir, f"{stem_base}_day.ktx", "ETC2_RGB")
+    _encode_ktx_with_compressonator(night_png, out_dir, f"{stem_base}_night.ktx", "ETC2_RGB")
+    return day_png.name, night_png.name
+
+
 
 def build_material_package(material_dump: list[dict] | str | Path, output_dir: str | Path) -> dict:
     if isinstance(material_dump, (str, Path)):
@@ -472,6 +766,7 @@ def build_material_package(material_dump: list[dict] | str | Path, output_dir: s
     textures_dir.mkdir(parents=True, exist_ok=True)
 
     used_names: set[str] = set()
+    copied_sources: dict[str, str] = {}
     white_lm = _write_white_lightmap(textures_dir)
     materials_spec = []
     material_name_by_object: dict[str, str] = {}
@@ -489,6 +784,7 @@ def build_material_package(material_dump: list[dict] | str | Path, output_dir: s
                 "material": material_name,
                 "template_material_name": row.get("template_material_name", material_name),
                 "blend_mode": row.get("blend_mode", "opaque_shadow"),
+                "alpha_discard_threshold": row.get("alpha_discard_threshold"),
                 "images": images,
             }
         if object_name and object_name not in material_name_by_object:
@@ -496,6 +792,9 @@ def build_material_package(material_dump: list[dict] | str | Path, output_dir: s
 
     for material_name, row in dedup.items():
         safe_name = _sanitize_name(material_name)
+        template_material_name = row.get("template_material_name", material_name)
+        is_spectator = _is_spectator_template_name(template_material_name)
+        is_stand = _sanitize_name(template_material_name).lower() == "stand"
         images = row["images"]
         if not images:
             raise PODMaterialPackageError(f"Material {material_name} has no image textures")
@@ -507,18 +806,26 @@ def build_material_package(material_dump: list[dict] | str | Path, output_dir: s
         if diffuse_entry is None:
             raise PODMaterialPackageError(f"Material {material_name} has no usable diffuse texture")
         diffuse_source = diffuse_entry["filepath"]
-        diffuse_rel = _copy_texture(diffuse_source, textures_dir, used_names)
+        diffuse_rel = _copy_texture(diffuse_source, textures_dir, used_names, copied_sources)
         mode = row.get("blend_mode", "opaque_shadow")
         secondary_rel = None
         tertiary_rel = None
+        secondary_source = None
+        secondary_night_source = None
         if mode in ("opaque_shadow", "alpha_shadow", "alpha_blend"):
             secondary_entry = _first_image_by_role(images, "secondary", "lightmap", "shadow")
+            secondary_night_entry = _first_image_by_role(images, "secondary_night")
             if secondary_entry and secondary_entry.get("filepath"):
-                secondary_rel = _copy_texture(secondary_entry["filepath"], textures_dir, used_names)
+                secondary_source = secondary_entry["filepath"]
+                secondary_rel = _copy_texture(secondary_source, textures_dir, used_names, copied_sources)
+                if secondary_night_entry and secondary_night_entry.get("filepath"):
+                    secondary_night_source = secondary_night_entry["filepath"]
             else:
-                secondary_rel = white_lm
+                template_key = _sanitize_name(template_material_name).lower()
+                secondary_rel = _ensure_stock_alpha_lightmap(out_dir) if mode == "alpha_shadow" and template_key == "alphatest" else white_lm
         pfx_filename = None
         effect_name = None
+        alpha_discard_threshold = None
         if mode == "ground":
             pfx_filename = "ground.pfx"
             effect_name = "grass_new"
@@ -527,7 +834,7 @@ def build_material_package(material_dump: list[dict] | str | Path, output_dir: s
                 or _first_distinct_image_by_role(images, diffuse_entry, "diffuse", "generic")
             )
             if ground_entry and ground_entry.get("filepath"):
-                secondary_rel = _copy_texture(ground_entry["filepath"], textures_dir, used_names)
+                secondary_rel = _copy_texture(ground_entry["filepath"], textures_dir, used_names, copied_sources)
             else:
                 secondary_rel = diffuse_rel
             tertiary_rel = "../misc/grass/dirt.png"
@@ -565,7 +872,7 @@ def build_material_package(material_dump: list[dict] | str | Path, output_dir: s
 
             secondary_entry = _first_image_by_role(images, "secondary", "lightmap", "shadow")
             if secondary_entry and secondary_entry.get("filepath"):
-                sec_rel = _copy_texture(secondary_entry["filepath"], textures_dir, used_names)
+                sec_rel = _copy_texture(secondary_entry["filepath"], textures_dir, used_names, copied_sources)
                 _encode_ktx_with_compressonator(
                     textures_dir / Path(sec_rel).name,
                     out_dir,
@@ -587,7 +894,7 @@ def build_material_package(material_dump: list[dict] | str | Path, output_dir: s
             )
             secondary_entry = _first_distinct_image_by_role(images, None, "secondary", "lightmap", "shadow", "ground", "ground_secondary")
             if secondary_entry and secondary_entry.get("filepath"):
-                sec_rel = _copy_texture(secondary_entry["filepath"], textures_dir, used_names)
+                sec_rel = _copy_texture(secondary_entry["filepath"], textures_dir, used_names, copied_sources)
                 _encode_ktx_with_compressonator(
                     textures_dir / Path(sec_rel).name,
                     out_dir,
@@ -603,14 +910,38 @@ def build_material_package(material_dump: list[dict] | str | Path, output_dir: s
                 )
             secondary_rel = None
         elif mode in ("opaque_shadow", "alpha_shadow", "alpha_blend"):
+            pfx_diffuse_rel = diffuse_rel
+            if is_spectator:
+                diffuse_rel, pfx_diffuse_rel = _copy_spectator_stock_diffuse(diffuse_source, out_dir)
+            if is_spectator and secondary_source:
+                spectator_day_name, _spectator_night_name = _write_spectator_lightmap_pair(
+                    secondary_source,
+                    out_dir,
+                    night_src_path=secondary_night_source,
+                )
+                secondary_rel = spectator_day_name
+            elif is_stand and secondary_source:
+                stand_day_name, _stand_night_name = _copy_stock_day_night_pair(
+                    secondary_source,
+                    out_dir,
+                    "Stand_LM",
+                    fmt="ETC2_RGB",
+                    night_src_path=secondary_night_source,
+                )
+                secondary_rel = f"textures/{stand_day_name}"
             pfx_filename = f"{safe_name}.pfx"
             effect_name = "c2u_alpha_shadow" if mode == "alpha_shadow" else "c2u_shadow"
+            alpha_discard_threshold = row.get("alpha_discard_threshold")
+            if not isinstance(alpha_discard_threshold, (int, float)):
+                alpha_discard_threshold = 0.1
             (out_dir / pfx_filename).write_text(
                 _pfx_lightmap_text(
-                    diffuse_rel,
+                    pfx_diffuse_rel,
                     secondary_rel,
                     alpha_cut=(mode == "alpha_shadow"),
                     effect_name=effect_name,
+                    force_alpha_opaque=False,
+                    alpha_discard_threshold=alpha_discard_threshold,
                 ),
                 encoding="utf-8",
             )
@@ -618,13 +949,14 @@ def build_material_package(material_dump: list[dict] | str | Path, output_dir: s
             {
                 "name": safe_name,
                 "source_material_name": material_name,
-                "template_material_name": row.get("template_material_name", material_name),
+                "template_material_name": template_material_name,
                 "mode": mode,
                 "diffuse_path": diffuse_rel,
                 "secondary_path": secondary_rel,
                 "tertiary_path": tertiary_rel,
                 "pfx_filename": pfx_filename,
                 "effect_name": effect_name,
+                "alpha_discard_threshold": alpha_discard_threshold,
             }
         )
 

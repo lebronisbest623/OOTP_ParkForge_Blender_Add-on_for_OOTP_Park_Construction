@@ -357,6 +357,7 @@ class MATERIAL_PT_ootp_pod_material(Panel):
         box.label(text="Texture Overrides")
         box.prop(mat, "ootp_primary_image", text="Primary")
         box.prop(mat, "ootp_secondary_image", text="Secondary")
+        box.prop(mat, "ootp_secondary_night_image", text="Secondary Night")
 
         info = layout.box()
         info.label(text="Leave blank to auto-detect from nodes.", icon="INFO")
@@ -431,6 +432,11 @@ def register():
         description="Optional explicit secondary image override used for ground/lightmap export",
         type=bpy.types.Image,
     )
+    bpy.types.Material.ootp_secondary_night_image = PointerProperty(
+        name="OOTP Secondary Night Image",
+        description="Optional explicit night secondary image override used for day/night lightmap export",
+        type=bpy.types.Image,
+    )
 
     for cls in classes:
         bpy.utils.register_class(cls)
@@ -444,6 +450,7 @@ def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 
+    del bpy.types.Material.ootp_secondary_night_image
     del bpy.types.Material.ootp_secondary_image
     del bpy.types.Material.ootp_primary_image
     del bpy.types.Material.ootp_template_material_name
