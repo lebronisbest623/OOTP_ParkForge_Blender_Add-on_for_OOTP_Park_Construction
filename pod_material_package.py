@@ -759,12 +759,18 @@ def _write_spectator_lightmap_pair(
     stem_base: str = "Spectator_LM",
 ) -> tuple[str, str]:
     if stem_base == "Spectator_LM":
-        day_ktx = out_dir / "Spectator_LM_day.ktx"
-        night_ktx = out_dir / "Spectator_LM_night.ktx"
-        if day_ktx.exists() and night_ktx.exists() and day_ktx.stat().st_size >= 500_000 and night_ktx.stat().st_size >= 500_000:
-            _normalize_ktx_for_ootp(day_ktx, "ETC2_RGB")
-            _normalize_ktx_for_ootp(night_ktx, "ETC2_RGB")
-            return "Spectator_LM_day.png", "Spectator_LM_night.png"
+        # OOTP's spectator cards are very sensitive to this lightmap pair.
+        # Stock patterned or low-res night maps can make crowds collapse to
+        # black in evening/night modes, so custom exports use a canonical
+        # flat 1024 white day/night pair every time.
+        row = bytes((255, 255, 255, 255)) * 1024
+        day_png = out_dir / "Spectator_LM_day.png"
+        night_png = out_dir / "Spectator_LM_night.png"
+        _write_png_rgba(day_png, 1024, 1024, [row] * 1024)
+        _write_png_rgba(night_png, 1024, 1024, [row] * 1024)
+        _encode_ktx_with_compressonator(day_png, out_dir, "Spectator_LM_day.ktx", "ETC2_RGB")
+        _encode_ktx_with_compressonator(night_png, out_dir, "Spectator_LM_night.ktx", "ETC2_RGB")
+        return "Spectator_LM_day.png", "Spectator_LM_night.png"
 
     def copy_or_flat(src_path: str | Path | None, dst_name: str, fallback: tuple[int, int, int]) -> Path:
         dst = out_dir / dst_name
