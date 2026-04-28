@@ -759,15 +759,16 @@ def _write_spectator_lightmap_pair(
     stem_base: str = "Spectator_LM",
 ) -> tuple[str, str]:
     if stem_base == "Spectator_LM":
-        # OOTP's spectator cards are very sensitive to this lightmap pair.
-        # Stock patterned or low-res night maps can make crowds collapse to
-        # black in evening/night modes, so custom exports use a canonical
-        # flat 1024 white day/night pair every time.
-        row = bytes((255, 255, 255, 255)) * 1024
-        day_png = out_dir / "Spectator_LM_day.png"
-        night_png = out_dir / "Spectator_LM_night.png"
-        _write_png_rgba(day_png, 1024, 1024, [row] * 1024)
-        _write_png_rgba(night_png, 1024, 1024, [row] * 1024)
+        # OOTP expects the spectator lightmap pair under these stock names, but
+        # artists may still bake custom source images in Blender.  Copy the
+        # explicit material overrides into the stock slots; fall back to a flat
+        # 1024 white pair only when no baked source exists.
+        day_png = _copy_or_white_lightmap(day_src_path, out_dir / "Spectator_LM_day.png")
+        night_png = _copy_or_white_lightmap(
+            night_src_path,
+            out_dir / "Spectator_LM_night.png",
+            fallback_src=day_png,
+        )
         _encode_ktx_with_compressonator(day_png, out_dir, "Spectator_LM_day.ktx", "ETC2_RGB")
         _encode_ktx_with_compressonator(night_png, out_dir, "Spectator_LM_night.ktx", "ETC2_RGB")
         return "Spectator_LM_day.png", "Spectator_LM_night.png"
@@ -790,6 +791,23 @@ def _write_spectator_lightmap_pair(
     _encode_ktx_with_compressonator(day_png, out_dir, f"{stem_base}_day.ktx", "ETC2_RGB")
     _encode_ktx_with_compressonator(night_png, out_dir, f"{stem_base}_night.ktx", "ETC2_RGB")
     return day_png.name, night_png.name
+
+
+def _copy_or_white_lightmap(src_path: str | Path | None, dst: Path, fallback_src: Path | None = None) -> Path:
+    src = Path(src_path) if src_path else None
+    if src and src.exists():
+        if _texture_source_key(src) != _texture_source_key(dst):
+            shutil.copy2(src, dst)
+        return dst
+
+    if fallback_src and fallback_src.exists():
+        if _texture_source_key(fallback_src) != _texture_source_key(dst):
+            shutil.copy2(fallback_src, dst)
+        return dst
+
+    row = bytes((255, 255, 255, 255)) * 1024
+    _write_png_rgba(dst, 1024, 1024, [row] * 1024)
+    return dst
 
 
 
