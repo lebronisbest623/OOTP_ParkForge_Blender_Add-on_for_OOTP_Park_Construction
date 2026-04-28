@@ -395,6 +395,7 @@ def _material_blend_mode(material: bpy.types.Material) -> str:
     if override:
         return override
     name = _template_semantic_name(material.name)
+    template_name = _template_semantic_name(_material_template_name_override(material) or "")
     if name == "ground":
         return "ground"
     if name == "background":
@@ -415,7 +416,7 @@ def _material_blend_mode(material: bpy.types.Material) -> str:
         or "seating" in name
     ):
         return "alpha_shadow"
-    if name.startswith("ootp_scoreboard") or name == "screen":
+    if name.startswith("ootp_scoreboard") or template_name.startswith("ootp_scoreboard") or name == "screen":
         return "emissive"
     blend = getattr(material, "blend_method", "OPAQUE")
     if blend == "CLIP":

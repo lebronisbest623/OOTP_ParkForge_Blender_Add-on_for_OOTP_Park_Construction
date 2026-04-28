@@ -557,6 +557,41 @@ def _is_spectator_template_name(name: str) -> bool:
     return _sanitize_name(name).lower().startswith("spectator")
 
 
+def _scoreboard_slot_name(material_name: str, template_material_name: str) -> str | None:
+    for candidate in (template_material_name, material_name):
+        safe = _sanitize_name(candidate)
+        if safe.lower().startswith("ootp_scoreboard"):
+            return safe
+    return None
+
+
+def _ensure_scoreboard_stub_ktx(out_dir: Path, stem: str) -> None:
+    """Create the tiny stock-style OOTP scoreboard marker KTX if needed."""
+    ktx = out_dir / f"{stem}.ktx"
+    if ktx.exists():
+        _normalize_ktx_for_ootp(ktx, "ETC2_RGB")
+        return
+
+    signature = b"\xabKTX 11\xbb\r\n\x1a\n"
+    values = [
+        0x04030201,  # endianness
+        0,           # glType
+        1,           # glTypeSize
+        0,           # glFormat
+        37492,       # GL_COMPRESSED_RGB8_ETC2
+        6407,        # GL_RGB
+        2,
+        2,
+        0,
+        0,
+        1,
+        1,
+        28,
+    ]
+    orientation = b"\x17\x00\x00\x00KTXorientation\x00S=r,T=d\x00\x00"
+    ktx.write_bytes(signature + struct.pack("<13I", *values) + orientation + struct.pack("<I", 8) + (b"\x00" * 8))
+
+
 def _copy_stock_day_night_pair(
     src_path: str | Path,
     out_dir: Path,
@@ -795,6 +830,7 @@ def build_material_package(material_dump: list[dict] | str | Path, output_dir: s
         template_material_name = row.get("template_material_name", material_name)
         is_spectator = _is_spectator_template_name(template_material_name)
         is_stand = _sanitize_name(template_material_name).lower() == "stand"
+        scoreboard_slot = _scoreboard_slot_name(material_name, template_material_name)
         images = row["images"]
         if not images:
             raise PODMaterialPackageError(f"Material {material_name} has no image textures")
@@ -806,7 +842,11 @@ def build_material_package(material_dump: list[dict] | str | Path, output_dir: s
         if diffuse_entry is None:
             raise PODMaterialPackageError(f"Material {material_name} has no usable diffuse texture")
         diffuse_source = diffuse_entry["filepath"]
-        diffuse_rel = _copy_texture(diffuse_source, textures_dir, used_names, copied_sources)
+        if scoreboard_slot:
+            _ensure_scoreboard_stub_ktx(out_dir, scoreboard_slot)
+            diffuse_rel = f"{scoreboard_slot}.png"
+        else:
+            diffuse_rel = _copy_texture(diffuse_source, textures_dir, used_names, copied_sources)
         mode = row.get("blend_mode", "opaque_shadow")
         secondary_rel = None
         tertiary_rel = None
@@ -843,13 +883,21 @@ def build_material_package(material_dump: list[dict] | str | Path, output_dir: s
                 encoding="utf-8",
             )
         elif mode == "emissive":
-            pfx_filename = f"{safe_name}.pfx"
-            effect_name = "material_screen"
             secondary_rel = None
-            (out_dir / pfx_filename).write_text(
-                _pfx_screen_text(diffuse_rel),
-                encoding="utf-8",
-            )
+            if scoreboard_slot:
+                # Stock OOTP scoreboards are recognized by the material/texture
+                # slot name and scoreboard_*.sl sidecar.  Preserve that path
+                # instead of exporting the visible Blender atlas as a normal
+                # emissive screen.
+                pfx_filename = None
+                effect_name = None
+            else:
+                pfx_filename = f"{safe_name}.pfx"
+                effect_name = "material_screen"
+                (out_dir / pfx_filename).write_text(
+                    _pfx_screen_text(diffuse_rel),
+                    encoding="utf-8",
+                )
         elif mode == "stock_lighting":
             # Preserve the exact template material block for Stand_Lighting.
             # Stock stadiums rely on hidden blend/state flags here, and
